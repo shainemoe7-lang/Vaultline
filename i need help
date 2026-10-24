@@ -1,0 +1,427 @@
+import SwiftUI
+import Charts
+
+struct PortfolioView: View {
+    @Environment(PortfolioStore.self) private var store
+    @State private var sheet: Sheet?
+
+    enum Sheet: String, Identifiable {
+        case send, receive
+        var id: String { rawValue }
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 24) {
+                header
+                actions
+                assetList
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 32)
+        }
+        .background(AppBackground())
+        .navigationTitle("Portfolio")
+        .navigationBarTitleDisplayMode(.inline)
+        .navigationDestination(for: Asset.self) { AssetDetailView(asset: $0) }
+        .sheet(item: $sheet) { s in
+            ActionSheet(mode: s == .send ? .send : .receive)
+                .presentationDetents([.medium, .large])
+        }
+    }
+
+    private var header: some View {
+        VStack(spacing: 8) {
+            Text("Total balance").font(.subheadline).foregroundStyle(.secondary)
+            Text(store.total.usd)
+                .font(.system(size: 44, weight: .bold, design: .rounded))
+                .contentTransition(.numericText())
+            ChangePill(change: store.dayChange)
+            Sparkline(values: store.assets.first?.history ?? [])
+                .frame(height: 90)
+                .padding(.top, 8)
+        }
+        .padding(.top, 12)
+    }
+
+    private var actions: some View {
+        HStack(spacing: 28) {
+            ActionButton(title: "Send", icon: "arrow.up") { sheet = .send }
+            ActionButton(title: "Receive", icon: "arrow.down") { sheet = .receive }
+            ActionButton(title: "Swap", icon: "arrow.left.arrow.right") {}
+        }
+    }
+
+    private var assetList: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Assets").font(.title3.weight(.semibold))
+            ForEach(store.assets) { asset in
+                NavigationLink(value: asset) {
+                    Card {
+                        HStack(spacing: 12) {
+                            AssetIcon(asset: asset)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(asset.name).font(.body.weight(.semibold))
+                                Text("\(asset.holdings.formatted()) \(asset.symbol)")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Sparkline(values: asset.history, color: asset.change24h >= 0 ? Theme.up : Theme.down)
+                                .frame(width: 60, height: 28)
+                            VStack(alignment: .trailing, spacing: 2) {
+                                Text(asset.value.usd).font(.body.weight(.semibold))
+                                Text(asset.change24h.pct)
+                                    .font(.caption)
+                                    .foregroundStyle(asset.change24h >= 0 ? Theme.up : Theme.down)
+                            }
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+}
+
+import SwiftUI
+import Observation
+
+struct Asset: Identifiable, Hashable {
+    let id = UUID()
+    let symbol: String
+    let name: String
+    let price: Double
+    let change24h: Double
+    let holdings: Double
+    let color: Color
+    let history: [Double]
+
+    var value: Double { price * holdings }
+}
+
+struct Transaction: Identifiable {
+    enum Kind: String { case sent = "Sent", received = "Received", swapped = "Swapped" }
+    let id = UUID()
+    let kind: Kind
+    let symbol: String
+    let amount: Double
+    let date: Date
+}
+
+@Observable
+final class PortfolioStore {
+    var assets: [Asset] = PortfolioStore.sampleAssets()
+    var transactions: [Transaction] = PortfolioStore.sampleTransactions()
+
+    var total: Double { assets.reduce(0) { $0 + $1.value } }
+
+    var dayChange: Double {
+        let prev = assets.reduce(0) { $0 + $1.value / (1 + $1.change24h / 100) }
+        return prev == 0 ? 0 : (total - prev) / prev * 100
+    }
+
+    /// Deterministic fake price history so previews and screenshots are stable.
+    private static func series(base: Double, volatility: Double, seed: Int) -> [Double] {
+        var value = base
+        var out: [Double] = []
+        var s = UInt64(seed &* 2654435761 & 0xFFFFFFFF) | 1
+        for _ in 0..<60 {
+            s = s &* 6364136223846793005 &+ 1442695040888963407
+            let r = Double((s >> 33) % 2000) / 1000.0 - 1.0
+            value *= 1 + r * volatility
+            out.append(value)
+        }
+        return out
+    }
+
+    static func sampleAssets() -> [Asset] {
+        [
+            Asset(symbol: "AAA", name: "Alpha Coin", price: 64210, change24h: 2.4, holdings: 0.42, color: .orange, history: series(base: 60000, volatility: 0.012, seed: 1)),
+            Asset(symbol: "BTA", name: "Beta Token", price: 3120.5, change24h: -1.3, holdings: 3.1, color: .indigo, history: series(base: 3200, volatility: 0.015, seed: 2)),
+            Asset(symbol: "GMA", name: "Gamma", price: 148.2, change24h: 5.8, holdings: 40, color: .purple, history: series(base: 130, volatility: 0.02, seed: 3)),
+            Asset(symbol: "DLT", name: "Delta Dollar", price: 1.0, change24h: 0.01, holdings: 2500, color: .teal, history: series(base: 1, volatility: 0.0006, seed: 4)),
+        ]
+    }
+
+    static func sampleTransactions() -> [Transaction] {
+        let now = Date()
+        return [
+            Transaction(kind: .received, symbol: "DLT", amount: 500, date: now.addingTimeInterval(-3_600)),
+            Transaction(kind: .swapped, symbol: "GMA", amount: 12, date: now.addingTimeInterval(-86_400)),
+            Transaction(kind: .sent, symbol: "BTA", amount: 0.4, date: now.addingTimeInterval(-3 * 86_400)),
+            Transaction(kind: .received, symbol: "AAA", amount: 0.05, date: now.addingTimeInterval(-6 * 86_400)),
+        ]
+    }
+}
+
+import SwiftUI
+import Charts
+
+struct AssetDetailView: View {
+    let asset: Asset
+    @State private var range = 30
+    @State private var selected: Int?
+
+    private var points: [Double] { Array(asset.history.suffix(range)) }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text((selected.flatMap { points.indices.contains($0) ? points[$0] : nil } ?? asset.price).usd)
+                        .font(.system(size: 36, weight: .bold, design: .rounded))
+                        .contentTransition(.numericText())
+                    ChangePill(change: asset.change24h)
+                }
+
+                Chart(Array(points.enumerated()), id: \.offset) { i, v in
+                    LineMark(x: .value("t", i), y: .value("Price", v))
+                        .interpolationMethod(.catmullRom)
+                        .foregroundStyle(asset.color.gradient)
+                    AreaMark(x: .value("t", i), y: .value("Price", v))
+                        .interpolationMethod(.catmullRom)
+                        .foregroundStyle(LinearGradient(colors: [asset.color.opacity(0.35), .clear], startPoint: .top, endPoint: .bottom))
+                    if let selected, selected == i {
+                        RuleMark(x: .value("t", i)).foregroundStyle(.white.opacity(0.4))
+                    }
+                }
+                .chartXSelection(value: $selected)
+                .chartXAxis(.hidden)
+                .chartYScale(domain: (points.min() ?? 0)...(points.max() ?? 1))
+                .frame(height: 220)
+
+                Picker("Range", selection: $range) {
+                    Text("1W").tag(7); Text("1M").tag(30); Text("2M").tag(60)
+                }
+                .pickerStyle(.segmented)
+
+                Card {
+                    VStack(spacing: 12) {
+                        row("Holdings", "\(asset.holdings.formatted()) \(asset.symbol)")
+                        Divider().overlay(.white.opacity(0.1))
+                        row("Value", asset.value.usd)
+                        Divider().overlay(.white.opacity(0.1))
+                        row("24h change", asset.change24h.pct)
+                    }
+                }
+            }
+            .padding(16)
+        }
+        .background(AppBackground())
+        .navigationTitle(asset.name)
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func row(_ k: String, _ v: String) -> some View {
+        HStack { Text(k).foregroundStyle(.secondary); Spacer(); Text(v).fontWeight(.semibold) }
+    }
+}
+
+import SwiftUI
+import Charts
+
+struct Sparkline: View {
+    let values: [Double]
+    var color: Color = Theme.accent
+
+    var body: some View {
+        Chart(Array(values.enumerated()), id: \.offset) { i, v in
+            LineMark(x: .value("t", i), y: .value("v", v))
+                .interpolationMethod(.catmullRom)
+                .foregroundStyle(color)
+        }
+        .chartXAxis(.hidden)
+        .chartYAxis(.hidden)
+        .chartYScale(domain: (values.min() ?? 0)...(values.max() ?? 1))
+    }
+}
+
+struct AssetIcon: View {
+    let asset: Asset
+    var body: some View {
+        Text(String(asset.symbol.prefix(1)))
+            .font(.headline.weight(.bold))
+            .foregroundStyle(.white)
+            .frame(width: 40, height: 40)
+            .background(asset.color.gradient, in: Circle())
+    }
+}
+
+struct ChangePill: View {
+    let change: Double
+    var body: some View {
+        Text(change.pct)
+            .font(.caption.weight(.semibold))
+            .padding(.horizontal, 8).padding(.vertical, 3)
+            .foregroundStyle(change >= 0 ? Theme.up : Theme.down)
+            .background((change >= 0 ? Theme.up : Theme.down).opacity(0.15), in: Capsule())
+    }
+}
+
+struct ActionButton: View {
+    let title: String
+    let icon: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 6) {
+                Image(systemName: icon).font(.title3)
+                    .frame(width: 52, height: 52)
+                    .background(Theme.card, in: Circle())
+                    .overlay(Circle().stroke(.white.opacity(0.1)))
+                Text(title).font(.caption)
+            }
+        }
+        .buttonStyle(.plain)
+        .sensoryFeedback(.impact, trigger: title)
+    }
+}
+
+import SwiftUI
+
+enum Theme {
+    static let accent = Color(red: 0.36, green: 0.85, blue: 0.74)
+    static let bgTop = Color(red: 0.05, green: 0.07, blue: 0.12)
+    static let bgBottom = Color(red: 0.09, green: 0.05, blue: 0.16)
+    static let card = Color.white.opacity(0.06)
+    static let up = Color(red: 0.30, green: 0.85, blue: 0.55)
+    static let down = Color(red: 1.0, green: 0.38, blue: 0.42)
+}
+
+struct AppBackground: View {
+    var body: some View {
+        LinearGradient(colors: [Theme.bgTop, Theme.bgBottom], startPoint: .top, endPoint: .bottom)
+            .ignoresSafeArea()
+    }
+}
+
+struct Card<Content: View>: View {
+    @ViewBuilder var content: Content
+    var body: some View {
+        content
+            .padding(16)
+            .background(Theme.card, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(.white.opacity(0.08)))
+    }
+}
+
+extension Double {
+    var usd: String { formatted(.currency(code: "USD")) }
+    var pct: String { (self >= 0 ? "+" : "") + formatted(.number.precision(.fractionLength(2))) + "%" }
+}
+
+import SwiftUI
+
+@main
+struct VaultlineApp: App {
+    @State private var store = PortfolioStore()
+
+    var body: some Scene {
+        WindowGroup {
+            RootView()
+                .environment(store)
+                .preferredColorScheme(.dark)
+        }
+    }
+}
+
+struct RootView: View {
+    var body: some View {
+        TabView {
+            NavigationStack { PortfolioView() }
+                .tabItem { Label("Portfolio", systemImage: "chart.pie.fill") }
+            NavigationStack { ActivityView() }
+                .tabItem { Label("Activity", systemImage: "clock.arrow.circlepath") }
+        }
+        .tint(Theme.accent)
+    }
+}
+
+import SwiftUI
+
+/// Demo-only send/receive UI. It does not move funds or hold keys.
+struct ActionSheet: View {
+    enum Mode { case send, receive }
+    let mode: Mode
+    @Environment(\.dismiss) private var dismiss
+    @State private var address = ""
+    @State private var amount = ""
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                if mode == .send {
+                    Section("Recipient") { TextField("Address", text: $address).textInputAutocapitalization(.never) }
+                    Section("Amount") { TextField("0.00", text: $amount).keyboardType(.decimalPad) }
+                    Section { Button("Review (demo)") { dismiss() }.frame(maxWidth: .infinity) }
+                } else {
+                    Section("Your demo address") {
+                        Text("demo-0000-0000-0000").font(.system(.body, design: .monospaced))
+                        ShareLink(item: "demo-0000-0000-0000") { Label("Share", systemImage: "square.and.arrow.up") }
+                    }
+                }
+            }
+            .scrollContentBackground(.hidden)
+            .background(AppBackground())
+            .navigationTitle(mode == .send ? "Send" : "Receive")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { Button("Close") { dismiss() } }
+        }
+    }
+}
+
+struct ActivityView: View {
+    @Environment(PortfolioStore.self) private var store
+
+    var body: some View {
+        List(store.transactions) { tx in
+            HStack {
+                Image(systemName: icon(tx.kind))
+                    .frame(width: 36, height: 36)
+                    .background(Theme.card, in: Circle())
+                VStack(alignment: .leading) {
+                    Text(tx.kind.rawValue).fontWeight(.semibold)
+                    Text(tx.date, style: .relative).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text("\(tx.amount.formatted()) \(tx.symbol)").fontWeight(.semibold)
+            }
+            .listRowBackground(Theme.card)
+        }
+        .scrollContentBackground(.hidden)
+        .background(AppBackground())
+        .navigationTitle("Activity")
+    }
+
+    private func icon(_ k: Transaction.Kind) -> String {
+        switch k {
+        case .sent: "arrow.up"
+        case .received: "arrow.down"
+        case .swapped: "arrow.left.arrow.right"
+        }
+    }
+}
+
+name: Vaultline
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  Vaultline:
+    type: application
+    platform: iOS
+    sources: [Sources]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.vaultline
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIUserInterfaceStyle: Dark
+        SWIFT_VERSION: "5.9"
+
+# Vaultline (demo)
+Original SwiftUI wallet-style UI with placeholder data. No keys, networking, or real funds.
+
+Build: `brew install xcodegen && xcodegen && open Vaultline.xcodeproj` (Xcode 15+, iOS 17+).
